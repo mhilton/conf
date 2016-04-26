@@ -1,0 +1,4 @@
+conf is a simple tool to help access the values in configuration files
+parsable by libucl [1] in shell scripts.
+
+[1] https://github.com/vstakhov/libucl/
