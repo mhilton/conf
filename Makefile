@@ -1,10 +1,11 @@
-CFLAGS?=-D_BSD_SOURCE --std=c99
+CC?=cc
+CFLAGS?=-D_BSD_SOURCE
 LDFLAGS?=-static
 
-.PHONY: clean indent
+.PHONY: clean
 
-conf: buf.o main.o output.o
-	$(CC) $(LDFLAGS) -o conf main.o buf.o output.o -lucl -lbsd
+conf: conf.o
+	$(CC) $(LDFLAGS) -o conf conf.o  -lucl
 
 clean:
-	-$(RM) conf buf.o main.o output.o
+	-$(RM) conf *.o
