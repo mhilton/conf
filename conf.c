@@ -1,5 +1,9 @@
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -14,6 +18,7 @@
 
 static char envkey[MAX_KEY_LEN];
 static char envval[MAX_VALUE_LEN];
+static void *data = NULL;
 
 static int cmdarg = 0;
 static bool env = false;
@@ -106,84 +111,45 @@ addvars(struct ucl_parser *parser, char **envp)
 	}
 }
 
-
 /*
- * keypart returns the next part of the specified key, or NULL 
- * if there are no more parts.
- */
-static const char *
-keypart()
-{
-	const char *start;
-
-	if (key == NULL || *key == '\0')
-		return NULL;
-	while (*key == '.')
-		key++;
-	if (key[0] == '\0')
-		return NULL;
-	start = key;
-	while (*key != '.' && *key != '\0')
-		key++;
-	if (*key == '.')
-		*key++ = '\0';
-	return start;
-}
-
-/*
- * findkey finds the object matching the supplied key, or NULL if there is
- * no such object.
- */
-static ucl_object_t const *
-findkey(ucl_object_t const *obj)
-{
-	const char *k;
-	long n;
-
-	while ((k = keypart()) != NULL && obj != NULL) {
-		strlcpy(envkey, k, MAX_KEY_LEN);
-		switch (ucl_object_type(obj)) {
-		case UCL_OBJECT:
-			obj = ucl_object_lookup(obj, k);
-			break;
-		case UCL_ARRAY: {
-			char *end;
-
-			n = strtol(k, &end, 10);
-			if (*end == '\0')
-				obj = ucl_array_find_index(obj, n);
-			else 
-				obj = NULL;
-			break;
-		}
-		default:
-			obj = NULL;
-			break;	
-		}
-	}
-	return obj;
-}
-
-/*
- * ucl_parser_add_stdin adds the contents of stdin to the parser.
+ * parse_file loads the file supplied on the command line, or stdin, and
+ * parses it using parser.
  */
 static void
-ucl_parser_add_stdin(struct ucl_parser  *parser)
+parse_file(struct ucl_parser  *parser)
 {
-	char *buf;
-	size_t len;
+	int fd = 0;
+	struct stat s;
 
-	buf = (char *)malloc(MAX_STDIN_LEN);
-	if (buf == NULL)
-		err(EX_OSERR, "cannot allocate buffer");
-	len = fread(buf, 1, MAX_STDIN_LEN, stdin);
-	if (feof(stdin))
-		ucl_parser_add_chunk(parser, buf, len);
-	free(buf);
-	if (ferror(stdin))
-		err(EX_IOERR, "cannot read " STDIN_NAME);
-	if (len == MAX_STDIN_LEN && !feof(stdin))
-		errx(EX_DATAERR, STDIN_NAME " too long");
+	if (file != NULL) {
+		if ((fd = open(file, O_RDONLY)) == -1)
+			err(EX_NOINPUT, "cannot open \"%s\"", file);
+	} else {
+		file = STDIN_NAME;
+	}
+	if (fstat(fd, &s) == -1)
+		err(EX_NOINPUT, "cannot read %s", file);
+	if (S_ISREG(s.st_mode))
+		data = mmap(NULL, s.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	else
+		data = mmap(NULL, MAX_STDIN_LEN, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (data == MAP_FAILED)
+		err(EX_NOINPUT, "cannot read %s", file);
+	if (!S_ISREG(s.st_mode)) {
+		int n;
+
+		while (s.st_size < MAX_STDIN_LEN) {
+			n = read(fd, data + s.st_size, MAX_STDIN_LEN - s.st_size);
+			if (n == -1)
+				err(EX_NOINPUT, "cannot read %s", file);
+			if (n == 0)
+				break;
+			s.st_size += n;
+		}
+		if (s.st_size == MAX_STDIN_LEN && n != 0)
+			err(EX_DATAERR, "%s too long", file);
+	}	
+	ucl_parser_add_chunk_full(parser, data, s.st_size, 0, UCL_DUPLICATE_MERGE, UCL_PARSE_UCL);
 }
 
 /*
@@ -278,11 +244,11 @@ print(ucl_object_t const *obj)
 }
 
 /*
- * expand extrapolates one or more environment variables out of obj. If
- * obj is of type UCL_OBJECT or UCL_ARRAY then a new value of name + __keys
+ * expand extrapolates one or more environment variables from obj. If obj
+ * is of type UCL_OBJECT or UCL_ARRAY then a new variable will be created
  * will be created containing a list of keys in obj and then expand will be
- * called recursively for each member. Otherwise a new environment vairiable
- * with the supplied name will be created with the value of obj.
+ * called recursively for each member. Otherwise a new environment variable
+ * will be created with the value of obj.
  */
 static void
 expand(size_t keylen, ucl_object_t const *obj)
@@ -293,9 +259,6 @@ expand(size_t keylen, ucl_object_t const *obj)
 
 	switch (ucl_object_type(obj)) {
 	case UCL_OBJECT:
-		l = strlcpy(envkey + keylen, "__keys", MAX_KEY_LEN - keylen);
-		if (l >= MAX_KEY_LEN - keylen)
-			errx(EX_DATAERR, "key too long \"%s\"", envkey);
 		if (snprintkeys(envval, MAX_VALUE_LEN, obj) >= MAX_VALUE_LEN)
 			errx(EX_DATAERR, "value too long \"%s\"", envval);
 		setenv(envkey, envval, 1);
@@ -307,9 +270,6 @@ expand(size_t keylen, ucl_object_t const *obj)
 		}
 		break;
 	case UCL_ARRAY:
-		l = strlcpy(envkey + keylen, "__keys", MAX_KEY_LEN - keylen);
-		if (l >= MAX_KEY_LEN - keylen)
-			errx(EX_DATAERR, "key too long \"%s\"", envkey);
 		if (snprintkeys(envval, MAX_VALUE_LEN, obj) >= MAX_VALUE_LEN)
 			errx(EX_DATAERR, "value too long \"%s\"", envval);
 		setenv(envkey, envval, 1);
@@ -361,33 +321,30 @@ main(int argc, char **argv, char **envp)
 
 	parseopt(argc, argv);
 
-	parser = ucl_parser_new(0);
+	parser = ucl_parser_new(UCL_PARSER_NO_IMPLICIT_ARRAYS | UCL_PARSER_ZEROCOPY);
 	if (parser == NULL) {
 		err(EX_OSERR, "cannot create parser");
 	}
 	addvars(parser, envp);
-
-	if (file == NULL) {
-		file = STDIN_NAME;
-		ucl_parser_add_stdin(parser);
-	} else {
-		ucl_parser_add_file(parser, file);
-	}
+	parse_file(parser);
 
 	if ((error = ucl_parser_get_error(parser))) {
 		errx(EX_DATAERR, "cannot load %s: %s", file, error);
 	}
 
 	obj = ucl_parser_get_object(parser);
-	*envkey = '\0';
-	kobj = findkey(obj);
+	if (key != NULL && strcmp(key, ".") != 0)
+		kobj = ucl_object_lookup_path(obj, key);
+	else
+		kobj = obj;
 	if (env) {
-		int nlen;
+		int nlen = 0;
+		char *s;
 
 		if (name != NULL)
 			nlen = strlcpy(envkey, name, MAX_KEY_LEN);
-		else
-			nlen = strlen(envkey);
+		else if ((s = strrchr(key, '.')) != NULL)
+			nlen = strlcpy(envkey, s + 1, MAX_KEY_LEN);
 		if (kobj != NULL)
 			expand(nlen, kobj);
 		status = run(argv + cmdarg);
