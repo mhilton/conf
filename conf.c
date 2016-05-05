@@ -70,9 +70,6 @@ parseopt(int argc, char **argv)
 			usage();
 		cmdarg = optind++;
 	}
-	if (optind < argc) {
-		usage();
-	}
 }
 
 /*
